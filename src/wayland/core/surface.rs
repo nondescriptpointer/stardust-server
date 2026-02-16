@@ -10,6 +10,7 @@ use crate::{
 		Client, Message, MessageSink, WaylandError, WaylandResult,
 		core::buffer::BufferUsage,
 		presentation::{MonotonicTimestamp, PresentationFeedback},
+		syncobj::{SurfaceSyncState, SyncobjSurface},
 		util::{
 			BufferedState, ClientExt, SurfaceCommitAwareBuffer, SurfaceCommitAwareBufferManager,
 		},
@@ -65,6 +66,7 @@ pub struct BufferState {
 #[derive(Debug)]
 pub struct SurfaceState {
 	pub buffer: Option<BufferState>,
+	pub sync_state: Option<SurfaceSyncState>,
 	pub density: f32,
 	pub geometry: Option<Geometry>,
 	pub min_size: Option<Vector2<u32>>,
@@ -75,6 +77,7 @@ impl Default for SurfaceState {
 	fn default() -> Self {
 		Self {
 			buffer: Default::default(),
+			sync_state: None,
 			density: 1.0,
 			geometry: None,
 			min_size: None,
@@ -86,6 +89,7 @@ impl Default for SurfaceState {
 impl BufferedState for SurfaceState {
 	fn apply(&mut self, pending: &mut Self) {
 		self.buffer = pending.buffer.clone();
+		self.sync_state = pending.sync_state.take();
 		self.density = pending.density;
 		self.geometry = pending.geometry;
 		self.min_size = pending.min_size;
@@ -96,6 +100,7 @@ impl BufferedState for SurfaceState {
 	fn get_initial_pending(&self) -> Self {
 		Self {
 			buffer: self.buffer.clone(),
+			sync_state: None,
 			density: self.density,
 			geometry: self.geometry,
 			min_size: self.min_size,
@@ -136,6 +141,7 @@ pub struct Surface {
 	state_buffer_manager: Arc<SurfaceCommitAwareBufferManager>,
 	children: Registry<Surface>,
 	parent: OnceLock<Weak<Surface>>,
+	syncobj_surface: Mutex<Option<Arc<SyncobjSurface>>>,
 }
 impl std::fmt::Debug for Surface {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,6 +185,7 @@ impl Surface {
 				state_buffer_manager: manager,
 				children: Registry::new(),
 				parent: OnceLock::new(),
+				syncobj_surface: Mutex::new(None),
 			}
 		})
 	}
@@ -422,9 +429,36 @@ impl Surface {
 			}
 		}
 	}
+
+	/// Set the syncobj surface for explicit sync
+	pub fn set_syncobj_surface(&self, syncobj_surface: Arc<SyncobjSurface>) {
+		*self.syncobj_surface.lock() = Some(syncobj_surface);
+	}
+
+	/// Check if this surface has a syncobj surface associated
+	pub fn has_syncobj_surface(&self) -> bool {
+		self.syncobj_surface.lock().is_some()
+	}
+
+	/// Clear the syncobj surface reference
+	pub fn clear_syncobj_surface(&self) {
+		*self.syncobj_surface.lock() = None;
+	}
+
+	/// Get the current explicit sync state (if any) for the render loop
+	pub fn current_sync_state(&self) -> Option<SurfaceSyncState> {
+		self.state.lock().current().sync_state.clone()
+	}
 }
 impl Surface {
 	fn on_commit(&self) {
+		// Before applying state, take pending sync points from the syncobj surface
+		if let Some(syncobj_surface) = self.syncobj_surface.lock().as_ref() {
+			if let Some(sync_state) = syncobj_surface.take_pending() {
+				self.state.lock().pending.sync_state = Some(sync_state);
+			}
+		}
+
 		self.state.lock().apply();
 		let mut handlers = self.on_commit_handlers.lock();
 		handlers.retain_mut(|f| (f)(self));

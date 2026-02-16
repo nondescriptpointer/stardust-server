@@ -12,6 +12,7 @@ use crate::wayland::{
 	mesa_drm::MesaDrm,
 	presentation::Presentation,
 	relative_pointer::RelativePointerManager,
+	syncobj::SyncobjManager,
 	util::ClientExt,
 	viewporter::Viewporter,
 	xdg::{
@@ -31,6 +32,7 @@ use waynest_protocols::server::{
 		presentation_time::wp_presentation::WpPresentation,
 		viewporter::wp_viewporter::WpViewporter,
 	},
+	staging::linux_drm_syncobj_v1::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
 	unstable::{
 		relative_pointer_unstable_v1::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
 		xdg_decoration_unstable_v1::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
@@ -53,6 +55,7 @@ impl RegistryGlobals {
 	pub const RELATIVE_POINTER: u32 = 10;
 	pub const SUBCOMPOSITOR: u32 = 11;
 	pub const XDG_DECORATION: u32 = 12;
+	pub const DRM_SYNCOBJ: u32 = 13;
 }
 
 #[derive(Debug, waynest_server::RequestDispatcher, Default)]
@@ -182,6 +185,15 @@ impl Registry {
 		)
 		.await?;
 
+		self.global(
+			client,
+			sender_id,
+			RegistryGlobals::DRM_SYNCOBJ,
+			SyncobjManager::INTERFACE.to_string(),
+			SyncobjManager::VERSION,
+		)
+		.await?;
+
 		Ok(())
 	}
 }
@@ -283,6 +295,16 @@ impl WlRegistry for Registry {
 					new_id.object_id,
 					XdgDecorationManager {
 						_version: new_id.version,
+						id: new_id.object_id,
+					},
+				)?;
+			}
+			RegistryGlobals::DRM_SYNCOBJ => {
+				tracing::info!("Binding wp_linux_drm_syncobj_manager_v1");
+
+				client.insert(
+					new_id.object_id,
+					SyncobjManager {
 						id: new_id.object_id,
 					},
 				)?;

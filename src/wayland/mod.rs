@@ -5,6 +5,7 @@ mod mesa_drm;
 mod presentation;
 mod registry;
 mod relative_pointer;
+mod syncobj;
 mod util;
 mod viewporter;
 mod xdg;
@@ -421,7 +422,8 @@ impl Plugin for WaylandPlugin {
 		app.add_systems(Update, update_graphics.before(ModelNodeSystemSet));
 		app.init_resource::<UsedBuffers>();
 		app.sub_app_mut(RenderApp)
-			.init_resource::<UsedBuffers>();
+			.init_resource::<UsedBuffers>()
+			.init_resource::<PendingReleaseSignalers>();
 	}
 	fn finish(&self, app: &mut App) {
 		app.sub_app_mut(RenderApp)
@@ -444,21 +446,40 @@ impl Default for UsedBuffers {
 	}
 }
 
-fn before_render(buffers: Res<UsedBuffers>) {
-	for buf in WL_SURFACE_REGISTRY
-		.get_valid_contents()
-		.into_iter()
-		.filter_map(|surface| surface.current_buffer_usage())
-	{
-		buffers.add_raw(buf);
+/// Stores release signalers for surfaces using explicit sync in the current frame.
+/// These get signaled when cleared after the render pass.
+#[derive(Resource, Default)]
+struct PendingReleaseSignalers(Vec<syncobj::ReleaseSignaler>);
+
+fn before_render(buffers: Res<UsedBuffers>, mut release_signalers: ResMut<PendingReleaseSignalers>) {
+	for surface in WL_SURFACE_REGISTRY.get_valid_contents() {
+		// Collect buffer usage for release tracking
+		if let Some(buf) = surface.current_buffer_usage() {
+			buffers.add_raw(buf);
+		}
+
+		// Handle explicit sync: push acquire semaphores and prepare release signalers
+		if let Some(sync_state) = surface.current_sync_state() {
+			sync_state.push_acquire_semaphore();
+			if let Some(release_signaler) = sync_state.create_release_signal() {
+				release_signalers.0.push(release_signaler);
+			} else {
+				// Vulkan release semaphore not available; signal release directly CPU-side
+				sync_state.release.signal_direct();
+			}
+		}
 	}
 	for surface in WL_SURFACE_REGISTRY.get_valid_contents() {
 		surface.frame_event();
 	}
 }
 
-fn after_render(buffers: Res<UsedBuffers>) {
+fn after_render(buffers: Res<UsedBuffers>, mut release_signalers: ResMut<PendingReleaseSignalers>) {
 	buffers.clear();
+	// Trigger release signalers Drop to import GPU-signaled sync file into release timeline point
+	release_signalers.0.clear();
+	// Clean up acquire semaphores that were used this frame
+	syncobj::cleanup_acquire_semaphores();
 }
 
 #[instrument(level = "debug", name = "Wayland frame", skip_all)]

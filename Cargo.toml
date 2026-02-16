@@ -113,7 +113,7 @@ bevy_mod_openxr = "0.3"
 # bevy_sk.git = "https://github.com/MalekiRe/bevy_sk"
 bevy_sk = { git = "https://github.com/technobaboo/bevy_sk", branch = "stochastic" }
 # bevy-dmabuf = "0.2.0"
-bevy-dmabuf.git = "https://github.com/Schmarni-Dev/bevy-dmabuf"
+bevy-dmabuf = { git = "https://github.com/nondescriptpointer/bevy-dmabuf", branch = "feature/external_semaphore_fd" }
 bevy-equirect.git = "https://github.com/technobaboo/bevy-equirect"
 
 # bevy-mesh-text-3d.git = "https://github.com/terhechte/bevy-mesh-text-3d"
@@ -138,6 +138,7 @@ waynest = { git = "https://github.com/verdiwm/waynest.git", default-features = f
 waynest-protocols = { git = "https://github.com/verdiwm/waynest.git", features = [
 	"server",
 	"stable",
+	"staging",
 	"unstable",
 	"mesa",
 	"tracing",
