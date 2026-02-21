@@ -5539,7 +5539,7 @@ dependencies = [
 [[package]]
 name = "stardust-xr-gluon"
 version = "0.50.0"
-source = "git+https://github.com/StardustXR/core.git#dab3536d2c354bae85abf96496abb94ffa0e512d"
+source = "git+https://github.com/StardustXR/core.git#7f21dcc5fe606fac73ff37319938d0ad6dfbb2ce"
 dependencies = [
  "futures",
  "nanoid",
@@ -5552,7 +5552,7 @@ dependencies = [
 [[package]]
 name = "stardust-xr-protocol"
 version = "0.50.0"
-source = "git+https://github.com/StardustXR/core.git#dab3536d2c354bae85abf96496abb94ffa0e512d"
+source = "git+https://github.com/StardustXR/core.git#7f21dcc5fe606fac73ff37319938d0ad6dfbb2ce"
 dependencies = [
  "fnv",
  "kdl",
@@ -5643,7 +5643,7 @@ dependencies = [
 [[package]]
 name = "stardust-xr-wire"
 version = "0.50.0"
-source = "git+https://github.com/StardustXR/core.git#dab3536d2c354bae85abf96496abb94ffa0e512d"
+source = "git+https://github.com/StardustXR/core.git#7f21dcc5fe606fac73ff37319938d0ad6dfbb2ce"
 dependencies = [
  "dirs",
  "flatbuffers",

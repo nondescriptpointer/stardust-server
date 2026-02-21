@@ -91,6 +91,76 @@ fn draw_field_gizmos(mut gizmos: Gizmos) {
 				Shape::Sphere(radius) => {
 					gizmos.sphere(transform.to_isometry(), radius, color);
 				}
+				Shape::Spline(spline) => {
+					const SAMPLES: usize = 16;
+					// Parallel transport the frame across all segments to avoid flipping
+					let mut prev_right: Option<Vec3> = None;
+
+					for (p0, p1, p2, p3, r0, r3) in spline.segments() {
+						let mut rails: [Vec<Vec3>; 4] =
+							std::array::from_fn(|_| Vec::with_capacity(SAMPLES + 1));
+
+						for i in 0..=SAMPLES {
+							let t = i as f32 / SAMPLES as f32;
+							let mt = 1.0 - t;
+							let pos = p0 * (mt * mt * mt)
+								+ p1 * (3.0 * mt * mt * t)
+								+ p2 * (3.0 * mt * t * t)
+								+ p3 * (t * t * t);
+							let tan = ((p1 - p0) * (3.0 * mt * mt)
+								+ (p2 - p1) * (6.0 * mt * t)
+								+ (p3 - p2) * (3.0 * t * t))
+								.try_normalize()
+								.unwrap_or(Vec3::Y);
+							let r = r0 + (r3 - r0) * t;
+
+							// Parallel transport: project previous right onto the plane perp to tan
+							let right = match prev_right {
+								Some(pr) => {
+									(pr - tan * tan.dot(pr)).try_normalize().unwrap_or(pr)
+								}
+								None => {
+									let up = if tan.dot(Vec3::Y).abs() < 0.9 {
+										Vec3::Y
+									} else {
+										Vec3::Z
+									};
+									tan.cross(up).normalize()
+								}
+							};
+							prev_right = Some(right);
+							let up = tan.cross(right);
+
+							for (k, dir) in [right, up, -right, -up].iter().enumerate() {
+								rails[k].push(transform.transform_point(pos + *dir * r));
+							}
+						}
+
+						for rail in &rails {
+							gizmos.linestrip(rail.iter().copied(), color);
+						}
+					}
+
+					for cp in &spline.control_points {
+						let anchor: Vec3 = cp.anchor.into();
+						let handle_out: Vec3 = cp.handle_out.into();
+						let handle_in: Vec3 = cp.handle_in.into();
+						let tangent = (handle_out - anchor)
+							.try_normalize()
+							.or_else(|| (anchor - handle_in).try_normalize())
+							.unwrap_or(Vec3::Y);
+						let world_anchor = transform.transform_point(anchor);
+						let world_tangent = (transform.rotation * tangent).normalize();
+						gizmos.circle(
+							bevy::math::Isometry3d::new(
+								world_anchor,
+								glam::Quat::from_rotation_arc(Vec3::Z, world_tangent),
+							),
+							cp.thickness,
+							color,
+						);
+					}
+				}
 				Shape::Torus(TorusShape { radius_a, radius_b }) => {
 					let minor_radius;
 					let major_radius;
@@ -134,6 +204,135 @@ impl FieldDebugGizmos {
 static FIELD_REGISTRY_DEBUG_GIZMOS: Registry<Field> = Registry::new();
 
 stardust_xr_server_codegen::codegen_field_protocol!();
+
+impl CubicControlPoint {
+	/// Exact SDF to a quadratic Bezier curve with variable radius in 3D.
+	/// a/b/c are control points, ra/rb/rc are their radii.
+	/// Returns signed distance (negative inside, positive outside).
+	/// Note: not a true Euclidean SDF when radii vary, but a conservative
+	/// underestimate — safe for sphere-tracing and fixed-step raymarching.
+	fn sd_quadratic_bezier_tube(
+		p: Vec3,
+		a: Vec3,
+		b: Vec3,
+		c: Vec3,
+		ra: f32,
+		rb: f32,
+		rc: f32,
+	) -> f32 {
+		let ab = b - a;
+		let bc = a - 2.0 * b + c;
+		let ca = ab * 2.0;
+		let d = a - p;
+
+		let kk = 1.0 / (1e-7 + bc.dot(bc));
+		let kx = kk * ab.dot(bc);
+		let ky = kk * (2.0 * ab.dot(ab) + d.dot(bc)) / 3.0;
+		let kz = kk * d.dot(ab);
+
+		let pp = ky - kx * kx;
+		let p3 = pp * pp * pp;
+		let q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+		let h = q * q + 4.0 * p3;
+
+		let t_star = if h >= 0.0 {
+			let h_sqrt = h.sqrt();
+			let xv = glam::Vec2::new((h_sqrt - q) / 2.0, (-h_sqrt - q) / 2.0);
+			let uv = xv.signum() * xv.abs().powf(1.0 / 3.0);
+			(uv.x + uv.y - kx).clamp(0.0, 1.0)
+		} else {
+			let z = (-pp).sqrt();
+			let v = (q / (pp * z * 2.0)).acos() / 3.0;
+			let m = v.cos();
+			let n = v.sin() * 1.732_050_8;
+			let t0 = ((m + m) * z - kx).clamp(0.0, 1.0);
+			let t1 = ((-n - m) * z - kx).clamp(0.0, 1.0);
+			let pt0 = d + (ca + bc * t0) * t0;
+			let pt1 = d + (ca + bc * t1) * t1;
+			if pt0.dot(pt0) <= pt1.dot(pt1) { t0 } else { t1 }
+		};
+
+		let s = 1.0 - t_star;
+		let r = s * s * ra + 2.0 * s * t_star * rb + t_star * t_star * rc;
+		let closest = a + (ca + bc * t_star) * t_star;
+		(p - closest).length() - r
+	}
+}
+
+impl CubicSplineShape {
+	/// Iterate over cubic Bezier segments as (P0, P1, P2, P3, r0, r3).
+	fn segments(&self) -> impl Iterator<Item = (Vec3, Vec3, Vec3, Vec3, f32, f32)> + '_ {
+		let n = self.control_points.len();
+		let count = if self.cyclic { n } else { n.saturating_sub(1) };
+
+		(0..count).map(move |i| {
+			let a = &self.control_points[i];
+			let b = &self.control_points[(i + 1) % n];
+			(
+				a.anchor.into(),
+				a.handle_out.into(),
+				b.handle_in.into(),
+				b.anchor.into(),
+				a.thickness,
+				b.thickness,
+			)
+		})
+	}
+
+	/// Split a cubic Bezier segment at t=0.5 using de Casteljau subdivision,
+	/// interpolating radii with the same structure.
+	/// Returns (left, right) each as (P0, P1, P2, ra, rb, rc).
+	fn split_cubic(
+		p0: Vec3,
+		p1: Vec3,
+		p2: Vec3,
+		p3: Vec3,
+		r0: f32,
+		r3: f32,
+	) -> (
+		(Vec3, Vec3, Vec3, f32, f32, f32),
+		(Vec3, Vec3, Vec3, f32, f32, f32),
+	) {
+		// geometry — de Casteljau at t=0.5
+		let p01 = p0.lerp(p1, 0.5);
+		let p12 = p1.lerp(p2, 0.5);
+		let p23 = p2.lerp(p3, 0.5);
+		let p012 = p01.lerp(p12, 0.5);
+		let p123 = p12.lerp(p23, 0.5);
+		let mid = p012.lerp(p123, 0.5);
+
+		// radii — linearly interpolated for phantom handle points
+		let rmid = (r0 + r3) * 0.5;
+		let r01 = (r0 + rmid) * 0.5;
+		let r23 = (rmid + r3) * 0.5;
+
+		(
+			(p0, p01, mid, r0, r01, rmid),
+			(mid, p123, p3, rmid, r23, r3),
+		)
+	}
+
+	/// SDF of the spline as a solid tube with per-control-point radii.
+	/// Returns signed distance (negative inside, positive outside).
+	pub fn sd_tube(&self, p: Vec3) -> f32 {
+		if self.control_points.len() < 2 {
+			return f32::INFINITY;
+		}
+
+		self.segments()
+			.map(|(p0, p1, p2, p3, r0, r3)| {
+				let (left, right) = Self::split_cubic(p0, p1, p2, p3, r0, r3);
+				let d_left = CubicControlPoint::sd_quadratic_bezier_tube(
+					p, left.0, left.1, left.2, left.3, left.4, left.5,
+				);
+				let d_right = CubicControlPoint::sd_quadratic_bezier_tube(
+					p, right.0, right.1, right.2, right.3, right.4, right.5,
+				);
+				d_left.min(d_right)
+			})
+			.fold(f32::INFINITY, f32::min)
+	}
+}
 
 pub static EXPORTED_FIELDS: LazyLock<DashMap<u64, Weak<Node>>> = LazyLock::new(DashMap::new);
 
@@ -293,6 +492,7 @@ impl FieldTrait for Field {
 				d.x.max(d.y).min(0.0) + d.max(vec2(0.0, 0.0)).length()
 			}
 			Shape::Sphere(radius) => p.length() - radius,
+			Shape::Spline(spline) => spline.sd_tube(p.into()),
 			Shape::Torus(TorusShape { radius_a, radius_b }) => {
 				let q = vec2(p.xz().length() - radius_a, p.y);
 				q.length() - radius_b
