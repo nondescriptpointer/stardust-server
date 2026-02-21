@@ -23,12 +23,12 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
 use bevy::gizmos::GizmoAsset;
 use bevy::gizmos::retained::Gizmo;
-use std::collections::{HashMap, HashSet};
 use color_eyre::eyre::OptionExt;
 use dashmap::DashMap;
 use glam::{Vec3, Vec3A, Vec3Swizzles, vec2, vec3, vec3a};
 use parking_lot::Mutex;
 use stardust_xr_wire::values::Vector3;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Weak};
 use zbus::interface;
 
@@ -131,7 +131,14 @@ fn sync_field_gizmos(
 				asset.linestrip(chain.iter().copied(), color);
 				let handle = gizmo_assets.add(asset);
 				let entity = commands
-					.spawn((Gizmo { handle, ..Default::default() }, field_transform, FieldGizmoMarker))
+					.spawn((
+						Gizmo {
+							handle,
+							..Default::default()
+						},
+						field_transform,
+						FieldGizmoMarker,
+					))
 					.id();
 				entry.1.push(entity);
 			}
@@ -151,13 +158,19 @@ fn compute_field_polylines(f: &Field) -> Vec<Vec<Vec3>> {
 	let bz_pos = ((FAR - f.local_distance(vec3a(0.0, 0.0, FAR))) * PAD).max(MIN_EXT);
 	let bz_neg = ((FAR - f.local_distance(vec3a(0.0, 0.0, -FAR))) * PAD).max(MIN_EXT);
 
-	const CELL_SIZE: f32 = 0.001;
-	const SLICE_STEP: f32 = 0.01;
+	const MAX_SLICES_PER_HALF_AXIS: i32 = 10;
+	let slice_step = 0.01_f32.max(
+		[bx_neg, bx_pos, by_neg, by_pos, bz_neg, bz_pos]
+			.into_iter()
+			.fold(0.0_f32, f32::max)
+			/ MAX_SLICES_PER_HALF_AXIS as f32,
+	);
+	let square_rez = 10.0;
 
 	let slice_positions = |neg: f32, pos: f32| {
-		let neg_count = (neg / SLICE_STEP).ceil() as i32;
-		let pos_count = (pos / SLICE_STEP).ceil() as i32;
-		(-neg_count..=pos_count).map(|i| i as f32 * SLICE_STEP)
+		let neg_count = (neg / slice_step).ceil() as i32;
+		let pos_count = (pos / slice_step).ceil() as i32;
+		(-neg_count..=pos_count).map(|i| i as f32 * slice_step)
 	};
 
 	let mut all_chains: Vec<Vec<Vec3>> = Vec::new();
@@ -166,7 +179,7 @@ fn compute_field_polylines(f: &Field) -> Vec<Vec<Vec3>> {
 		for chain in chain_segments(marching_squares_slice(
 			|p| f.local_distance(p),
 			(-bx_neg, bx_pos, -by_neg, by_pos),
-			CELL_SIZE,
+			slice_step / square_rez,
 			move |u, v| vec3a(u, v, z),
 		)) {
 			all_chains.push(chain);
@@ -177,7 +190,7 @@ fn compute_field_polylines(f: &Field) -> Vec<Vec<Vec3>> {
 		for chain in chain_segments(marching_squares_slice(
 			|p| f.local_distance(p),
 			(-bx_neg, bx_pos, -bz_neg, bz_pos),
-			CELL_SIZE,
+			slice_step / square_rez,
 			move |u, v| vec3a(u, y, v),
 		)) {
 			all_chains.push(chain);
@@ -188,7 +201,7 @@ fn compute_field_polylines(f: &Field) -> Vec<Vec<Vec3>> {
 		for chain in chain_segments(marching_squares_slice(
 			|p| f.local_distance(p),
 			(-by_neg, by_pos, -bz_neg, bz_pos),
-			CELL_SIZE,
+			slice_step / square_rez,
 			move |u, v| vec3a(x, u, v),
 		)) {
 			all_chains.push(chain);
