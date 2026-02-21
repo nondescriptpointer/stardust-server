@@ -528,9 +528,15 @@ impl CubicSplineShape {
 		let r01 = (r0 + rmid) * 0.5;
 		let r23 = (rmid + r3) * 0.5;
 
+		// Approximate each cubic half as a quadratic by averaging the two inner
+		// control points (standard degree reduction). Using just p01 or p123 alone
+		// drops too much curvature and displaces the tube surface.
+		let left_mid_cp = p01.lerp(p012, 0.5);
+		let right_mid_cp = p123.lerp(p23, 0.5);
+
 		(
-			(p0, p01, mid, r0, r01, rmid),
-			(mid, p123, p3, rmid, r23, r3),
+			(p0, left_mid_cp, mid, r0, r01, rmid),
+			(mid, right_mid_cp, p3, rmid, r23, r3),
 		)
 	}
 
