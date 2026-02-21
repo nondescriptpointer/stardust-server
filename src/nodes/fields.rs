@@ -14,13 +14,16 @@ use crate::nodes::spatial::SPATIAL_ASPECT_ALIAS_INFO;
 use crate::nodes::spatial::SPATIAL_REF_ASPECT_ALIAS_INFO;
 use crate::nodes::spatial::Transform;
 use bevy::app::{Plugin, Update};
+use bevy::asset::Assets;
 use bevy::color::Color;
+use bevy::ecs::component::Component;
+use bevy::ecs::entity::Entity;
+use bevy::ecs::query::With;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::schedule::IntoScheduleConfigs;
-use bevy::ecs::system::Res;
-use bevy::gizmos::gizmos::Gizmos;
-use bevy::gizmos::primitives::dim3::GizmoPrimitive3d;
-use bevy::math::primitives::{Cylinder, Torus};
+use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::gizmos::GizmoAsset;
+use bevy::gizmos::retained::Gizmo;
+use std::collections::{HashMap, HashSet};
 use color_eyre::eyre::OptionExt;
 use dashmap::DashMap;
 use glam::{Vec3, Vec3A, Vec3Swizzles, vec2, vec3, vec3a};
@@ -56,135 +59,341 @@ impl Plugin for FieldDebugGizmoPlugin {
 				.await;
 		});
 		app.insert_resource(FieldDebugGizmosEnabled(rx));
-		app.add_systems(
-			Update,
-			draw_field_gizmos.run_if(|res: Res<FieldDebugGizmosEnabled>| *res.0.borrow()),
-		);
+		app.init_resource::<FieldGizmoState>();
+		app.add_systems(Update, sync_field_gizmos);
 	}
 }
 
 #[derive(Resource)]
 struct FieldDebugGizmosEnabled(tokio::sync::watch::Receiver<bool>);
 
-fn draw_field_gizmos(mut gizmos: Gizmos) {
-	FIELD_REGISTRY_DEBUG_GIZMOS
-		.get_valid_contents()
-		.iter()
-		.for_each(|f| {
-			let transform =
-				bevy::transform::components::Transform::from_matrix(f.spatial.global_transform());
-			let color = Color::srgb_u8(0x04, 0xFD, 0x4C);
-			match f.shape.lock().clone() {
-				Shape::Box(size) => gizmos.cuboid(transform.with_scale(size.into()), color),
-				Shape::Cylinder(CylinderShape { length, radius }) => {
-					gizmos
-						.primitive_3d(
-							&Cylinder {
-								radius,
-								half_height: length * 0.5,
-							},
-							transform.to_isometry(),
-							color,
-						)
-						.resolution(32);
-				}
-				Shape::Sphere(radius) => {
-					gizmos.sphere(transform.to_isometry(), radius, color);
-				}
-				Shape::Spline(spline) => {
-					const SAMPLES: usize = 16;
-					// Parallel transport the frame across all segments to avoid flipping
-					let mut prev_right: Option<Vec3> = None;
+#[derive(Component)]
+struct FieldGizmoMarker;
 
-					for (p0, p1, p2, p3, r0, r3) in spline.segments() {
-						let mut rails: [Vec<Vec3>; 4] =
-							std::array::from_fn(|_| Vec::with_capacity(SAMPLES + 1));
+#[derive(Resource, Default)]
+struct FieldGizmoState(HashMap<usize, (u64, Vec<Entity>)>);
 
-						for i in 0..=SAMPLES {
-							let t = i as f32 / SAMPLES as f32;
-							let mt = 1.0 - t;
-							let pos = p0 * (mt * mt * mt)
-								+ p1 * (3.0 * mt * mt * t)
-								+ p2 * (3.0 * mt * t * t)
-								+ p3 * (t * t * t);
-							let tan = ((p1 - p0) * (3.0 * mt * mt)
-								+ (p2 - p1) * (6.0 * mt * t)
-								+ (p3 - p2) * (3.0 * t * t))
-								.try_normalize()
-								.unwrap_or(Vec3::Y);
-							let r = r0 + (r3 - r0) * t;
+fn sync_field_gizmos(
+	enabled: Res<FieldDebugGizmosEnabled>,
+	mut commands: Commands,
+	mut gizmo_assets: ResMut<Assets<GizmoAsset>>,
+	mut state: ResMut<FieldGizmoState>,
+	mut transforms: Query<&mut bevy::transform::components::Transform, With<FieldGizmoMarker>>,
+) {
+	if !*enabled.0.borrow() {
+		for (_, (_, entities)) in state.0.drain() {
+			for e in entities {
+				commands.entity(e).despawn();
+			}
+		}
+		return;
+	}
 
-							// Parallel transport: project previous right onto the plane perp to tan
-							let right = match prev_right {
-								Some(pr) => {
-									(pr - tan * tan.dot(pr)).try_normalize().unwrap_or(pr)
-								}
-								None => {
-									let up = if tan.dot(Vec3::Y).abs() < 0.9 {
-										Vec3::Y
-									} else {
-										Vec3::Z
-									};
-									tan.cross(up).normalize()
-								}
-							};
-							prev_right = Some(right);
-							let up = tan.cross(right);
+	let fields = FIELD_REGISTRY_DEBUG_GIZMOS.get_valid_contents();
+	let color = Color::srgb_u8(0x04, 0xFD, 0x4C);
 
-							for (k, dir) in [right, up, -right, -up].iter().enumerate() {
-								rails[k].push(transform.transform_point(pos + *dir * r));
-							}
-						}
+	let alive_ptrs: HashSet<usize> = fields.iter().map(|f| Arc::as_ptr(f) as usize).collect();
 
-						for rail in &rails {
-							gizmos.linestrip(rail.iter().copied(), color);
-						}
-					}
+	state.0.retain(|ptr, (_, entities)| {
+		if alive_ptrs.contains(ptr) {
+			true
+		} else {
+			for e in entities.drain(..) {
+				commands.entity(e).despawn();
+			}
+			false
+		}
+	});
 
-					for cp in &spline.control_points {
-						let anchor: Vec3 = cp.anchor.into();
-						let handle_out: Vec3 = cp.handle_out.into();
-						let handle_in: Vec3 = cp.handle_in.into();
-						let tangent = (handle_out - anchor)
-							.try_normalize()
-							.or_else(|| (anchor - handle_in).try_normalize())
-							.unwrap_or(Vec3::Y);
-						let world_anchor = transform.transform_point(anchor);
-						let world_tangent = (transform.rotation * tangent).normalize();
-						gizmos.circle(
-							bevy::math::Isometry3d::new(
-								world_anchor,
-								glam::Quat::from_rotation_arc(Vec3::Z, world_tangent),
-							),
-							cp.thickness,
-							color,
-						);
-					}
-				}
-				Shape::Torus(TorusShape { radius_a, radius_b }) => {
-					let minor_radius;
-					let major_radius;
-					if radius_a >= radius_b {
-						major_radius = radius_a;
-						minor_radius = radius_b;
-					} else {
-						major_radius = radius_b;
-						minor_radius = radius_a;
-					}
-					gizmos
-						.primitive_3d(
-							&Torus {
-								minor_radius,
-								major_radius,
-							},
-							transform.to_isometry(),
-							color,
-						)
-						.minor_resolution(32)
-						.major_resolution(32);
+	for f in &fields {
+		let ptr = Arc::as_ptr(f) as usize;
+		let field_transform =
+			bevy::transform::components::Transform::from_matrix(f.spatial.global_transform());
+		let cache = f.polyline_cache.lock();
+		let current_gen = cache.0;
+
+		let entry = state.0.entry(ptr).or_insert((u64::MAX, vec![]));
+
+		if entry.0 == current_gen {
+			for &e in &entry.1 {
+				if let Ok(mut t) = transforms.get_mut(e) {
+					*t = field_transform;
 				}
 			}
-		});
+		} else if let Some(chains) = cache.1.as_ref() {
+			for e in entry.1.drain(..) {
+				commands.entity(e).despawn();
+			}
+			entry.0 = current_gen;
+
+			for chain in chains {
+				let mut asset = GizmoAsset::new();
+				asset.linestrip(chain.iter().copied(), color);
+				let handle = gizmo_assets.add(asset);
+				let entity = commands
+					.spawn((Gizmo { handle, ..Default::default() }, field_transform, FieldGizmoMarker))
+					.id();
+				entry.1.push(entity);
+			}
+		}
+		// else: generation changed but chains not ready yet — keep old entities visible
+	}
+}
+
+fn compute_field_polylines(f: &Field) -> Vec<Vec<Vec3>> {
+	const FAR: f32 = 100.0;
+	const PAD: f32 = 1.1;
+	const MIN_EXT: f32 = 0.005;
+	let bx_pos = ((FAR - f.local_distance(vec3a(FAR, 0.0, 0.0))) * PAD).max(MIN_EXT);
+	let bx_neg = ((FAR - f.local_distance(vec3a(-FAR, 0.0, 0.0))) * PAD).max(MIN_EXT);
+	let by_pos = ((FAR - f.local_distance(vec3a(0.0, FAR, 0.0))) * PAD).max(MIN_EXT);
+	let by_neg = ((FAR - f.local_distance(vec3a(0.0, -FAR, 0.0))) * PAD).max(MIN_EXT);
+	let bz_pos = ((FAR - f.local_distance(vec3a(0.0, 0.0, FAR))) * PAD).max(MIN_EXT);
+	let bz_neg = ((FAR - f.local_distance(vec3a(0.0, 0.0, -FAR))) * PAD).max(MIN_EXT);
+
+	const CELL_SIZE: f32 = 0.001;
+	const SLICE_STEP: f32 = 0.01;
+
+	let slice_positions = |neg: f32, pos: f32| {
+		let neg_count = (neg / SLICE_STEP).ceil() as i32;
+		let pos_count = (pos / SLICE_STEP).ceil() as i32;
+		(-neg_count..=pos_count).map(|i| i as f32 * SLICE_STEP)
+	};
+
+	let mut all_chains: Vec<Vec<Vec3>> = Vec::new();
+
+	for z in slice_positions(bz_neg, bz_pos).chain([-(bz_neg / PAD), bz_pos / PAD]) {
+		for chain in chain_segments(marching_squares_slice(
+			|p| f.local_distance(p),
+			(-bx_neg, bx_pos, -by_neg, by_pos),
+			CELL_SIZE,
+			move |u, v| vec3a(u, v, z),
+		)) {
+			all_chains.push(chain);
+		}
+	}
+
+	for y in slice_positions(by_neg, by_pos).chain([-(by_neg / PAD), by_pos / PAD]) {
+		for chain in chain_segments(marching_squares_slice(
+			|p| f.local_distance(p),
+			(-bx_neg, bx_pos, -bz_neg, bz_pos),
+			CELL_SIZE,
+			move |u, v| vec3a(u, y, v),
+		)) {
+			all_chains.push(chain);
+		}
+	}
+
+	for x in slice_positions(bx_neg, bx_pos).chain([-(bx_neg / PAD), bx_pos / PAD]) {
+		for chain in chain_segments(marching_squares_slice(
+			|p| f.local_distance(p),
+			(-by_neg, by_pos, -bz_neg, bz_pos),
+			CELL_SIZE,
+			move |u, v| vec3a(x, u, v),
+		)) {
+			all_chains.push(chain);
+		}
+	}
+
+	all_chains
+}
+
+fn spawn_field_polylines(field: Arc<Field>) {
+	let generation = {
+		let mut cache = field.polyline_cache.lock();
+		cache.0 += 1;
+		cache.1 = None;
+		cache.0
+	};
+	tokio::task::spawn_blocking(move || {
+		let chains = compute_field_polylines(&field);
+		let mut cache = field.polyline_cache.lock();
+		if cache.0 == generation {
+			cache.1 = Some(chains);
+		}
+	});
+}
+
+/// Sample the SDF on a 2D grid over the given bounds and run standard marching squares
+/// to find line segments at the zero isoline. Returns a list of (start, end) segment pairs
+/// in local 3D space.
+///
+/// - `sample`: evaluates the SDF at a 3D local-space point
+/// - `bounds`: (u_min, u_max, v_min, v_max) extent of the 2D grid
+/// - `cell_size`: size of each grid cell
+/// - `lift`: maps 2D (u, v) coordinates to a 3D local-space point on the slice plane
+fn marching_squares_slice<S, L>(
+	sample: S,
+	bounds: (f32, f32, f32, f32),
+	cell_size: f32,
+	lift: L,
+) -> Vec<(Vec3, Vec3)>
+where
+	S: Fn(Vec3A) -> f32,
+	L: Fn(f32, f32) -> Vec3A,
+{
+	let (u_min, u_max, v_min, v_max) = bounds;
+	let cols = ((u_max - u_min) / cell_size).ceil() as usize;
+	let rows = ((v_max - v_min) / cell_size).ceil() as usize;
+	if cols == 0 || rows == 0 {
+		return vec![];
+	}
+
+	// Sample the SDF at each grid vertex: grid[row][col]
+	let grid: Vec<Vec<f32>> = (0..=rows)
+		.map(|j| {
+			let v = v_min + j as f32 * cell_size;
+			(0..=cols)
+				.map(|i| {
+					let u = u_min + i as f32 * cell_size;
+					sample(lift(u, v))
+				})
+				.collect()
+		})
+		.collect();
+
+	// Marching squares lookup table.
+	// Corners per cell: 0=(i,j), 1=(i+1,j), 2=(i+1,j+1), 3=(i,j+1)
+	// Edges: 0=bottom(c0-c1), 1=right(c1-c2), 2=top(c2-c3), 3=left(c3-c0)
+	// Case index bit k is set when corner k is inside (d <= 0).
+	const TABLE: [&[(usize, usize)]; 16] = [
+		&[],               // 0000 – all outside
+		&[(0, 3)],         // 0001 – c0
+		&[(0, 1)],         // 0010 – c1
+		&[(1, 3)],         // 0011 – c0 c1
+		&[(1, 2)],         // 0100 – c2
+		&[(0, 3), (1, 2)], // 0101 – c0 c2 (ambiguous)
+		&[(0, 2)],         // 0110 – c1 c2
+		&[(2, 3)],         // 0111 – c0 c1 c2
+		&[(2, 3)],         // 1000 – c3
+		&[(0, 2)],         // 1001 – c0 c3
+		&[(0, 1), (2, 3)], // 1010 – c1 c3 (ambiguous)
+		&[(1, 2)],         // 1011 – c0 c1 c3
+		&[(1, 3)],         // 1100 – c2 c3
+		&[(0, 1)],         // 1101 – c0 c2 c3
+		&[(0, 3)],         // 1110 – c1 c2 c3
+		&[],               // 1111 – all inside
+	];
+
+	let mut segments = Vec::new();
+
+	for j in 0..rows {
+		for i in 0..cols {
+			let d0 = grid[j][i]; // c0: (i,   j  )
+			let d1 = grid[j][i + 1]; // c1: (i+1, j  )
+			let d2 = grid[j + 1][i + 1]; // c2: (i+1, j+1)
+			let d3 = grid[j + 1][i]; // c3: (i,   j+1)
+
+			let case_idx = ((d0 <= 0.0) as usize)
+				| (((d1 <= 0.0) as usize) << 1)
+				| (((d2 <= 0.0) as usize) << 2)
+				| (((d3 <= 0.0) as usize) << 3);
+
+			let entry = TABLE[case_idx];
+			if entry.is_empty() {
+				continue;
+			}
+
+			let u0 = u_min + i as f32 * cell_size;
+			let v0 = v_min + j as f32 * cell_size;
+			let u1 = u0 + cell_size;
+			let v1 = v0 + cell_size;
+
+			let c0: Vec3 = lift(u0, v0).into();
+			let c1: Vec3 = lift(u1, v0).into();
+			let c2: Vec3 = lift(u1, v1).into();
+			let c3: Vec3 = lift(u0, v1).into();
+
+			// Linearly interpolate to find the zero crossing on an edge.
+			let edge_pt = |e: usize| -> Vec3 {
+				let (ca, da, cb, db) = match e {
+					0 => (c0, d0, c1, d1),
+					1 => (c1, d1, c2, d2),
+					2 => (c2, d2, c3, d3),
+					_ => (c3, d3, c0, d0),
+				};
+				let denom = da - db;
+				let t = if denom.abs() < 1e-10 { 0.5 } else { da / denom };
+				ca.lerp(cb, t)
+			};
+
+			for &(ea, eb) in entry {
+				segments.push((edge_pt(ea), edge_pt(eb)));
+			}
+		}
+	}
+
+	segments
+}
+
+/// Chain a list of `(start, end)` segment pairs into polylines by connecting shared endpoints.
+/// Segments sharing an endpoint (within quantized precision) are merged into longer chains.
+/// Closed loops are detected and the first point is appended to close them.
+fn chain_segments(segments: Vec<(Vec3, Vec3)>) -> Vec<Vec<Vec3>> {
+	use std::collections::{HashMap, VecDeque};
+
+	if segments.is_empty() {
+		return vec![];
+	}
+
+	// Quantize a Vec3 to a (i32,i32,i32) key at 0.1 mm precision for endpoint matching.
+	let quantize = |v: Vec3| -> (i32, i32, i32) {
+		(
+			(v.x * 10_000.0) as i32,
+			(v.y * 10_000.0) as i32,
+			(v.z * 10_000.0) as i32,
+		)
+	};
+
+	// Build adjacency map: endpoint key -> [(segment_idx, other_endpoint)]
+	let mut adj: HashMap<(i32, i32, i32), Vec<(usize, Vec3)>> = HashMap::new();
+	for (idx, &(a, b)) in segments.iter().enumerate() {
+		adj.entry(quantize(a)).or_default().push((idx, b));
+		adj.entry(quantize(b)).or_default().push((idx, a));
+	}
+
+	let mut used = vec![false; segments.len()];
+	let mut chains: Vec<Vec<Vec3>> = Vec::new();
+
+	for start in 0..segments.len() {
+		if used[start] {
+			continue;
+		}
+		used[start] = true;
+		let (a, b) = segments[start];
+		let mut chain: VecDeque<Vec3> = vec![a, b].into();
+
+		// Extend forward from tail.
+		loop {
+			let tail = *chain.back().unwrap();
+			let found = adj
+				.get(&quantize(tail))
+				.and_then(|ns| ns.iter().find(|&&(idx, _)| !used[idx]).copied());
+			let Some((idx, next)) = found else { break };
+			used[idx] = true;
+			// Close the loop if the next point rejoins the chain head.
+			if quantize(next) == quantize(*chain.front().unwrap()) {
+				chain.push_back(*chain.front().unwrap());
+				break;
+			}
+			chain.push_back(next);
+		}
+
+		// Extend backward from head to catch segments that connect before the start.
+		loop {
+			let head = *chain.front().unwrap();
+			let found = adj
+				.get(&quantize(head))
+				.and_then(|ns| ns.iter().find(|&&(idx, _)| !used[idx]).copied());
+			let Some((idx, prev)) = found else { break };
+			used[idx] = true;
+			chain.push_front(prev);
+		}
+
+		chains.push(chain.into_iter().collect());
+	}
+
+	chains
 }
 
 struct FieldDebugGizmos {
@@ -434,6 +643,7 @@ const MAX_RAY_LENGTH: f32 = 1000_f32;
 pub struct Field {
 	pub spatial: Arc<Spatial>,
 	pub shape: Mutex<Shape>,
+	polyline_cache: Mutex<(u64, Option<Vec<Vec<Vec3>>>)>,
 }
 impl Field {
 	pub fn add_to(node: &Arc<Node>, shape: Shape) -> Result<Arc<Field>> {
@@ -441,9 +651,11 @@ impl Field {
 		let field = Field {
 			spatial,
 			shape: Mutex::new(shape),
+			polyline_cache: Mutex::new((0, None)),
 		};
 		let field = node.add_aspect(field);
 		FIELD_REGISTRY_DEBUG_GIZMOS.add_raw(&field);
+		spawn_field_polylines(field.clone());
 		node.add_aspect(FieldRef);
 		Ok(field)
 	}
@@ -463,6 +675,7 @@ impl FieldAspect for Field {
 	fn set_shape(node: Arc<Node>, _calling_client: Arc<Client>, shape: Shape) -> Result<()> {
 		let field = node.get_aspect::<Field>()?;
 		*field.shape.lock() = shape;
+		spawn_field_polylines(field.clone());
 		Ok(())
 	}
 
