@@ -26,7 +26,10 @@ use mint::Vector2;
 use parking_lot::Mutex;
 use std::{
 	fmt::Display,
-	sync::{Arc, OnceLock, Weak},
+	sync::{
+		Arc, OnceLock, Weak,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 use tracing::info;
 use waynest::ObjectId;
@@ -136,6 +139,7 @@ pub struct Surface {
 	state_buffer_manager: Arc<SurfaceCommitAwareBufferManager>,
 	children: Registry<Surface>,
 	parent: OnceLock<Weak<Surface>>,
+	needs_flush: AtomicBool,
 }
 impl std::fmt::Debug for Surface {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,6 +183,7 @@ impl Surface {
 				state_buffer_manager: manager,
 				children: Registry::new(),
 				parent: OnceLock::new(),
+				needs_flush: AtomicBool::new(false),
 			}
 		})
 	}
@@ -215,6 +220,9 @@ impl Surface {
 	}
 	pub fn currently_has_valid_buffer(&self) -> bool {
 		self.state.lock().current().has_valid_buffer()
+	}
+	pub fn applied_has_valid_buffer(&self) -> bool {
+		self.state.lock().applied.has_valid_buffer()
 	}
 
 	/// Set a filter that controls whether current state in SurfaceCommitAwareBuffers is updated on
@@ -412,8 +420,21 @@ impl Surface {
 	pub fn parent(&self) -> Option<Arc<Surface>> {
 		self.parent.get()?.upgrade()
 	}
+	/// Promote applied state to current at frame boundaries.
+	/// Only performs work if a commit happened since the last flush.
+	/// Recursively flushes all children.
+	pub fn flush_to_current(&self) {
+		if self.needs_flush.swap(false, Ordering::AcqRel) {
+			self.state_buffer_manager.update_current();
+			self.run_updated_state_handlers();
+		}
+		for child in self.children.get_valid_contents() {
+			child.flush_to_current();
+		}
+	}
+
 	pub fn update_current_state_recursive(&self) {
-		info!("update current state");
+		self.needs_flush.store(false, Ordering::Release);
 		self.state_buffer_manager.update_current();
 		self.run_updated_state_handlers();
 		for child in self.children.get_valid_contents() {
@@ -428,12 +449,7 @@ impl Surface {
 		self.state.lock().apply();
 		let mut handlers = self.on_commit_handlers.lock();
 		handlers.retain_mut(|f| (f)(self));
-
-		if self.requires_surface_syncronization() {
-			self.update_current_state_recursive();
-		} else {
-			self.run_updated_state_handlers();
-		}
+		self.needs_flush.store(true, Ordering::Release);
 	}
 	fn run_updated_state_handlers(&self) {
 		let mut handlers = self.on_updated_current_state_handlers.lock();

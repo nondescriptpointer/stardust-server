@@ -92,7 +92,7 @@ impl XdgSurface for Surface {
 			let mut mapped_lock = toplevel.mapped.lock();
 			if mapped_lock.is_none()
 				&& configured.load(std::sync::atomic::Ordering::SeqCst)
-				&& surface.currently_has_valid_buffer()
+				&& surface.applied_has_valid_buffer()
 			{
 				let mapped_inner = MappedInner::create(&seat.upgrade().unwrap(), &toplevel, pid);
 				*surface.panel_item.lock() = Arc::downgrade(&mapped_inner.panel_item);
@@ -183,7 +183,7 @@ impl XdgSurface for Surface {
 			};
 
 			if configured.load(std::sync::atomic::Ordering::SeqCst)
-				&& surface.currently_has_valid_buffer()
+				&& surface.applied_has_valid_buffer()
 			{
 				panel_item
 					.backend

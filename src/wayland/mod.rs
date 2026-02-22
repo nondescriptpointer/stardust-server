@@ -468,6 +468,11 @@ fn update_graphics(
 	mut images: ResMut<Assets<Image>>,
 ) {
 	for surface in WL_SURFACE_REGISTRY.get_valid_contents() {
+		if surface.parent().is_none() {
+			surface.flush_to_current();
+		}
+	}
+	for surface in WL_SURFACE_REGISTRY.get_valid_contents() {
 		surface.update_graphics(&dmatexes, &mut materials, &mut images);
 	}
 }

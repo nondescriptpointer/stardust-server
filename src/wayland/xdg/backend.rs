@@ -121,7 +121,7 @@ impl Backend for XdgBackend {
 		let top_level = self.toplevel();
 		let surface = top_level.wl_surface();
 		let state_lock = surface.state_lock();
-		let surface_state = state_lock.current();
+		let surface_state = &state_lock.applied;
 
 		let size = surface_state
 			.buffer

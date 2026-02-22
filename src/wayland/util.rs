@@ -68,18 +68,9 @@ impl SurfaceCommitAwareBufferManager {
 		})
 	}
 	pub fn update_current(&self) {
-		info!("pre lock");
 		let mut lock = self.registry.lock();
-		info!("post lock");
 		lock.retain(|v| v.valid());
 		lock.iter().for_each(|v| v.update_current());
-	}
-	pub fn requires_surface_syncronization(&self) -> bool {
-		if let Some(surface) = self.surface.upgrade() {
-			false
-		} else {
-			false
-		}
 	}
 }
 trait SurfaceCommitAwareBufferFns: Send + Sync + 'static + Debug {
@@ -134,9 +125,6 @@ impl<State: BufferedState> SurfaceCommitAwareBuffer<State> {
 	}
 	pub fn apply(&mut self) {
 		self.applied.apply(&mut self.pending);
-		if !self.buffer_manager.requires_surface_syncronization() {
-			self.update_current();
-		}
 	}
 	pub fn update_current(&mut self) {
 		self.current.apply(&mut self.applied);
